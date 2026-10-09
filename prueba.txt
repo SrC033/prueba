@@ -1,2 +1,128 @@
 hola mundo
 
+ 
+ 
+ 
+ 
+ import { onUnmounted, ref, watch } from 'vue'
+import { ApiError } from '../../../shared/lib/http'
+import { useProjectsStore } from '../../projects/store'
+import {
+  indexFile,
+  listFiles,
+  type ProjectFile,
+  type SignedFile,
+  signFile,
+  uploadFile,
+} from '../api'
+
+export function useChatFiles() {
+  const projects = useProjectsStore()
+  const files = ref<ProjectFile[]>([])
+  const uploading = ref(false)
+  const status = ref('')
+  const error = ref('')
+  const pendingName = ref('')
+  let pending: { projectId: string; file: File; signed?: SignedFile; uploaded: boolean } | undefined
+  let request: AbortController | undefined
+  let listing: AbortController | undefined
+  async function refresh(projectId: string) {
+    listing?.abort()
+    const current = new AbortController()
+    listing = current
+    try {
+      const result = await listFiles(projectId, current.signal)
+      if (!current.signal.aborted && projects.active?.id === projectId) files.value = result
+    } catch (failure) {
+      if (!current.signal.aborted && projects.active?.id === projectId)
+        error.value =
+          failure instanceof ApiError ? failure.message : 'No se pudieron consultar los archivos.'
+    }
+  }
+  async function process() {
+    const work = pending
+    if (!work || uploading.value || projects.active?.id !== work.projectId) return
+    const current = new AbortController()
+    request = current
+    uploading.value = true
+    error.value = ''
+    try {
+      if (!work.signed) {
+        status.value = 'Preparando archivo…'
+        work.signed = await signFile(work.projectId, work.file, current.signal)
+      }
+      if (!work.uploaded) {
+        status.value = 'Subiendo archivo…'
+        await uploadFile(work.projectId, work.signed.id, work.file, current.signal)
+        work.uploaded = true
+      }
+      status.value = 'Vectorizando y guardando en PostgreSQL… Puede tardar unos minutos.'
+      const result = await indexFile(work.projectId, work.signed.url, current.signal)
+      if (current.signal.aborted || projects.active?.id !== work.projectId) return
+      listing?.abort()
+      files.value = files.value.filter((item) => item.id !== result.id)
+      files.value.push({
+        id: result.id,
+        name: result.nombre,
+        chunks: result.chunks,
+        indexedAtUtc: result.indexedAtUtc,
+      })
+      status.value = `${result.nombre}: listo para consultar con MÍA.`
+      pending = undefined
+      pendingName.value = ''
+    } catch (failure) {
+      if (current.signal.aborted) return
+      status.value = ''
+      error.value =
+        failure instanceof ApiError ? failure.message : 'No se pudo procesar el archivo. Reintenta.'
+    } finally {
+      if (request === current) {
+        request = undefined
+        uploading.value = false
+      }
+    }
+  }
+  function attach(file: File) {
+    if (uploading.value) return
+    error.value = ''
+    status.value = ''
+    pending = undefined
+    pendingName.value = ''
+    if (!projects.active?.id) {
+      error.value = 'Selecciona un proyecto antes de adjuntar.'
+      return
+    }
+    if (!/\.(pdf|docx|txt|md|csv|json)$/i.test(file.name)) {
+      error.value = 'Usa PDF, DOCX, TXT, MD, CSV o JSON.'
+      return
+    }
+    if (file.size === 0 || file.size > 10 * 1024 * 1024) {
+      error.value = 'El archivo debe tener contenido y no superar 10 MiB.'
+      return
+    }
+    pending = { projectId: projects.active.id, file, uploaded: false }
+    pendingName.value = file.name
+    void process()
+  }
+  watch(
+    () => projects.active?.id,
+    (id) => {
+      request?.abort()
+      listing?.abort()
+      request = undefined
+      uploading.value = false
+      pending = undefined
+      pendingName.value = ''
+      files.value = []
+      status.value = ''
+      error.value = ''
+      if (id) void refresh(id)
+    },
+    { immediate: true },
+  )
+  onUnmounted(() => {
+    request?.abort()
+    listing?.abort()
+  })
+  return { files, uploading, status, error, pendingName, attach, retry: process }
+}
